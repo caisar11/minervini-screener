@@ -25,9 +25,54 @@ def send_telegram(message: str):
     except Exception as e:
         print(f"❌ 텔레그램 통신 오류: {e}")
 
-def run_scanner(scan_limit=150):
+# 네이버 금융 분기 실적(영업이익 성장률) 조회 함수
+def get_financial_growth(code):
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={code}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url, headers=headers, timeout=4)
+        
+        tables = pd.read_html(res.text)
+        finance_df = None
+        for t in tables:
+            str_cols = str(t.columns)
+            str_vals = str(t.iloc[:, 0].values)
+            if '주요재무정보' in str_cols or '매출액' in str_vals or '영업이익' in str_vals:
+                finance_df = t
+                break
+                
+        if finance_df is None:
+            return {"op_growth": 0.0, "has_fund": False}
+
+        finance_df.set_index(finance_df.columns[0], inplace=True)
+        op_row = None
+        for idx in finance_df.index:
+            if '영업이익' in str(idx) and '영업이익률' not in str(idx):
+                op_row = finance_df.loc[idx]
+                break
+                
+        if op_row is None:
+            return {"op_growth": 0.0, "has_fund": False}
+
+        vals = [pd.to_numeric(str(v).replace(',', ''), errors='coerce') for v in op_row.values[-5:]]
+        valid_vals = [v for v in vals if not pd.isna(v)]
+        
+        if len(valid_vals) >= 2:
+            latest_op = valid_vals[-1]
+            prev_op = valid_vals[-2]
+            if prev_op > 0 and latest_op:
+                growth = round(((latest_op - prev_op) / abs(prev_op)) * 100, 1)
+                return {"op_growth": growth, "has_fund": True}
+            elif latest_op > 0 and prev_op <= 0:
+                return {"op_growth": 999.0, "has_fund": True} # 흑자전환
+                
+        return {"op_growth": 0.0, "has_fund": False}
+    except Exception:
+        return {"op_growth": 0.0, "has_fund": False}
+
+def run_scanner(scan_limit=150, min_op_growth=15.0):
     today_str = datetime.today().strftime('%Y-%m-%d')
-    print(f"[{today_str}] 마크 미너비니 일일 자동 스크리너 가동...")
+    print(f"[{today_str}] 마크 미너비니 SEPA(차트+실적) 자동 스크리너 가동...")
     
     df_krx = fdr.StockListing('KRX')
     if 'Marcap' in df_krx.columns:
@@ -39,6 +84,11 @@ def run_scanner(scan_limit=150):
     for _, row in target_stocks.iterrows():
         code = row['Code']
         name = row['Name']
+        
+        # 우선주(코드 끝자리 '5', '7' 등) 및 스팩(SPAC) 제외
+        if code.endswith(('5', '7', 'K', 'L')) or '스팩' in name:
+            continue
+            
         try:
             start_date = (datetime.today() - timedelta(days=420)).strftime('%Y-%m-%d')
             df = fdr.DataReader(code, start=start_date)
@@ -58,7 +108,7 @@ def run_scanner(scan_limit=150):
             s50, s150, s200 = latest['SMA_50'], latest['SMA_150'], latest['SMA_200']
             h52, l52 = latest['52w_high'], latest['52w_low']
             
-            # 8대 트렌드 템플릿 검증
+            # 1. 기술적 조건 검증
             cond_pass = (
                 c > s150 and c > s200 and
                 s150 > s200 and
@@ -70,29 +120,34 @@ def run_scanner(scan_limit=150):
             )
             
             if cond_pass:
-                vcp_data = analyze_vcp_pattern(df)
-                qualified.append({
-                    "name": name,
-                    "code": code,
-                    "price": int(c),
-                    "dist_52h": round(((h52 - c) / h52) * 100, 1),
-                    "reb_52l": round(((c - l52) / l52) * 100, 1),
-                    "vcp": vcp_data
-                })
+                # 2. 펀더멘탈(영업이익 성장률) 검증
+                fund = get_financial_growth(code)
+                if fund["has_fund"] and fund["op_growth"] >= min_op_growth:
+                    vcp_data = analyze_vcp_pattern(df)
+                    qualified.append({
+                        "name": name,
+                        "code": code,
+                        "price": int(c),
+                        "dist_52h": round(((h52 - c) / h52) * 100, 1),
+                        "op_growth": fund["op_growth"],
+                        "vcp": vcp_data
+                    })
         except Exception:
             continue
             
     if qualified:
-        msg = f"🏆 <b>[{today_str}] 마크 미너비니 추세추종 종목 ({len(qualified)}건)</b>\n"
+        msg = f"🏆 <b>[{today_str}] 미너비니 SEPA 실적+추세 주도주 ({len(qualified)}건)</b>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
         for item in qualified:
             v = item['vcp']
             vcp_badge = "✅VCP돌파임박" if v.get('is_vcp') else f"📊{v.get('stage', '수축중')}"
             vol_badge = "💧거래량감소" if v.get('is_vol_dryup') else "일반거래량"
+            growth_txt = f"+{item['op_growth']}%" if item['op_growth'] < 900 else "흑자전환"
             
             msg += (
                 f"🔥 <b>{item['name']}</b> ({item['code']})\n"
-                f"• 현재가: <b>{item['price']:,}원</b> (52주고점대비 -{item['dist_52h']}%)\n"
+                f"• 현재가: <b>{item['price']:,}원</b> (고점대비 -{item['dist_52h']}%)\n"
+                f"• 실적성장: <b>영업익 {growth_txt}</b>\n"
                 f"• 패턴상태: {vcp_badge} | {vol_badge}\n"
                 f"• 피벗돌파선: <b>{v.get('pivot_price', 0):,}원</b>\n"
                 f"• 손절선: {v.get('stop_loss', 0):,}원 (-{v.get('risk_pct', 0)}%)\n"
@@ -100,9 +155,9 @@ def run_scanner(scan_limit=150):
                 f"────────────────────\n"
             )
     else:
-        msg = f"ℹ️ [{today_str}] 오늘의 미너비니 조건 만족 종목이 없습니다."
+        msg = f"ℹ️ [{today_str}] 오늘의 실적+차트 동시 만족 종목이 없습니다."
         
     send_telegram(msg)
 
 if __name__ == "__main__":
-    run_scanner(scan_limit=150)
+    run_scanner(scan_limit=150, min_op_growth=15.0)
